@@ -39,10 +39,24 @@ object R2dbcOffsetStore {
   final case class Record(pid: Pid, seqNr: SeqNr, timestamp: Instant)
 
   sealed trait InflightEntry {
-    def seqNr: SeqNr
+    def sequenceNumbers: immutable.Seq[SeqNr]
+    def last: SeqNr
+    def toRecovering: Recovering
+    def toProcessing: Processing
   }
-  case class Processing(seqNr: SeqNr) extends InflightEntry
-  case class Recovering(seqNr: SeqNr) extends InflightEntry
+  case class Processing(sequenceNumbers: immutable.Seq[SeqNr], last: SeqNr) extends InflightEntry {
+    def toRecovering = Recovering(sequenceNumbers, last)
+    val toProcessing = this
+    def add(seqNr: SeqNr): Processing = Processing(sequenceNumbers :+ seqNr, seqNr)
+  }
+  object Processing {
+    def apply(seqNr: SeqNr): Processing = Processing(immutable.Seq(seqNr), seqNr)
+  }
+
+  case class Recovering(sequenceNumbers: immutable.Seq[SeqNr], last: SeqNr) extends InflightEntry {
+    def toProcessing = Processing(sequenceNumbers, last)
+    val toRecovering = this
+  }
 
   object State {
     val empty: State = State(Map.empty, Vector.empty, Instant.EPOCH)
@@ -409,7 +423,7 @@ private[projection] class R2dbcOffsetStore(
       currentInflight.filter {
         case (inflightPid, inflight) =>
           newState.byPid.get(inflightPid) match {
-            case Some(r) => r.seqNr < inflight.seqNr
+            case Some(r) => r.seqNr < inflight.last
             case None    => true
           }
         case _ => true
@@ -428,18 +442,26 @@ private[projection] class R2dbcOffsetStore(
    * When the processing of an event fails, this method is called to remove the event from the inflight map. This is
    * need for retry scenarios in which
    */
-  def updateInflightOnError[Envelope](envelope: Envelope): Boolean = {
+  def updateInflightOnError[Envelope](envelope: Envelope): Unit = {
     envelope match {
       case eventEnvelope: EventEnvelope[_] if eventEnvelope.offset.isInstanceOf[TimestampOffset] =>
         val currentInflight = getInflight()
-        val updatedInflight = currentInflight.map { case (pid, inflight) =>
-          if (pid == eventEnvelope.persistenceId && inflight.seqNr == eventEnvelope.sequenceNr)
-            pid -> Recovering(inflight.seqNr)
-          else
-            pid -> inflight
-        }
-        inflight.compareAndSet(currentInflight, updatedInflight)
-      case _ => false
+
+        var updated = false
+        val updatedInflight =
+          currentInflight.updatedWith(eventEnvelope.persistenceId) {
+            case Some(processing: Processing) =>
+              updated = true
+              // doesn't matter which seqNr is causing error, if we match a pid,
+              // all the seqNrs for that pid will be re-delivered (eg: grouped async projections)
+              Some(processing.toRecovering)
+
+            case whatever => whatever
+          }
+
+        if (updated) inflight.compareAndSet(currentInflight, updatedInflight)
+
+      case _ => ()
     }
   }
 
@@ -496,24 +518,35 @@ private[projection] class R2dbcOffsetStore(
         val isValidSeqNrForInflight = () => {
           currentInflight.get(pid) match {
             // is seqNr the follow up of the inflight one?
-            case Some(Processing(inflightSeqNr)) => seqNr == inflightSeqNr + 1
-            // has entry for pid, but it's Recovering.
-            // That happens after a failure. In that case, we should get back the same seqNr
-            case Some(Recovering(inflightSeqNr)) => seqNr == inflightSeqNr
-            case None                            => false
+            case Some(processing: Processing) =>
+              seqNr == processing.last + 1
+            // has entry for pid, but it's Recovering? that happens after a failure.
+            // In such case, we return true so we can later move back to processing
+            case Some(recovering: Recovering) =>
+              recovering.sequenceNumbers.contains(seqNr)
+            case None =>
+              false
           }
         }
 
+        val isNextEventBasedOnState = () => {
+          val current = currentState.byPid.get(pid).map(_.seqNr).getOrElse(Long.MinValue)
+          seqNr == current + 1
+        }
         val ok =
           (seqNr == 1L && (!currentState.byPid.contains(pid)) && (!currentInflight.contains(pid))) ||
           JDuration
             .between(timestampOffset.timestamp, timestampOffset.readTimestamp)
             .compareTo(settings.acceptNewSequenceNumberAfterAge) >= 0 ||
           isValidSeqNrForInflight() ||
-          seqNr == currentState.byPid.get(pid).map(_.seqNr).getOrElse(Long.MinValue) + 1
+          isNextEventBasedOnState()
 
         if (ok) {
-          val newInflight = currentInflight.updated(pid, Processing(seqNr))
+          val newInflight = currentInflight.updatedWith(pid) {
+            case Some(processing: Processing) => Some(processing.add(seqNr))
+            case Some(recovering: Recovering) => Some(recovering)
+            case _                            => Some(Processing(seqNr))
+          }
           if (inflight.compareAndSet(currentInflight, newInflight))
             ok
           else
@@ -531,8 +564,8 @@ private[projection] class R2dbcOffsetStore(
         val pid = eventEnvelope.persistenceId
         val seqNr = eventEnvelope.sequenceNr
         getInflight().get(pid) match {
-          case Some(inflight) if inflight.seqNr == seqNr => true
-          case _                                         => false
+          case Some(inflight) => inflight.sequenceNumbers.contains(seqNr)
+          case _              => false
         }
       case _ => true
     }

@@ -247,7 +247,7 @@ class R2dbcTimestampOffsetStoreSpec
       offsetStore.isSequenceNumberAccepted(envelope2) shouldBe true
       // simulate envelope processing error
       offsetStore.updateInflightOnError(envelope2)
-      offsetStore.getInflight() shouldBe Map("p1" -> Recovering(2L))
+      offsetStore.getInflight() shouldBe Map("p1" -> Processing(2L).toRecovering)
 
       // seqNr 3 is not accepted, still waiting for seqNr 2
       offsetStore.isSequenceNumberAccepted(envelope3) shouldBe false

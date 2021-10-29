@@ -673,11 +673,13 @@ class R2dbcTimestampOffsetProjectionSpec
       val envelopes = createEnvelopesWithDuplicates(pid1, pid2)
 
       val projection =
-        R2dbcProjection.groupedWithinAsync(
-          projectionId,
-          Some(settings),
-          sourceProvider = sourceProvider(envelopes),
-          handler = () => handler())
+        R2dbcProjection
+          .groupedWithinAsync(
+            projectionId,
+            Some(settings),
+            sourceProvider = sourceProvider(envelopes),
+            handler = () => handler())
+//          .withGroup(2, 3.seconds)
 
       projectionTestKit.run(projection) {
         result1.toString shouldBe "e1-1|e1-2|e1-3|e1-4|"
@@ -714,11 +716,13 @@ class R2dbcTimestampOffsetProjectionSpec
       val envelopes1 = createEnvelopesUnknownSequenceNumbers(startTime, pid1, pid2)
 
       val projection1 =
-        R2dbcProjection.groupedWithinAsync(
-          projectionId,
-          Some(settings),
-          sourceProvider = sourceProvider(envelopes1),
-          handler = () => handler())
+        R2dbcProjection
+          .groupedWithinAsync(
+            projectionId,
+            Some(settings),
+            sourceProvider = sourceProvider(envelopes1),
+            handler = () => handler())
+          .withGroup(2, 3.seconds)
 
       projectionTestKit.run(projection1) {
         result1.toString shouldBe "e1-1|e1-2|e1-3|"
@@ -729,20 +733,68 @@ class R2dbcTimestampOffsetProjectionSpec
       logger.debug("Starting backtracking")
       val envelopes2 = createEnvelopesBacktrackingUnknownSequenceNumbers(startTime, pid1, pid2)
       val projection2 =
-        R2dbcProjection.groupedWithinAsync(
-          projectionId,
-          Some(settings),
-          sourceProvider = backtrackingSourceProvider(envelopes2),
-          handler = () => handler())
+        R2dbcProjection
+          .groupedWithinAsync(
+            projectionId,
+            Some(settings),
+            sourceProvider = backtrackingSourceProvider(envelopes2),
+            handler = () => handler())
+          .withGroup(2, 3.seconds)
 
       projectionTestKit.run(projection2) {
-        // FIXME result1 is "e1-1|e1-2|e1-3|e1-2|e1-3|e1-4|e1-5|e1-6|
-//        result1.toString shouldBe "e1-1|e1-2|e1-3|e1-4|e1-5|e1-6|"
+        result1.toString shouldBe "e1-1|e1-2|e1-3|e1-4|e1-5|e1-6|"
         result2.toString shouldBe "e2-3|e2-4|"
       }
 
       offsetShouldBe(envelopes2.last.offset)
-      pending // still pending because of result1 (see above)
+    }
+
+    "re-delivery inflight events after failure with retry recovery strategy for async projection" in {
+
+      val pid1 = UUID.randomUUID().toString
+      val pid2 = UUID.randomUUID().toString
+      val projectionId = genRandomProjectionId()
+      implicit val offsetStore = createOffsetStore(projectionId)
+
+      val result = new StringBuffer()
+
+      val failOnce = new AtomicBoolean(true)
+
+      def handler(): Handler[Seq[EventEnvelope[String]]] = new Handler[Seq[EventEnvelope[String]]] {
+        override def process(envelopes: Seq[EventEnvelope[String]]): Future[Done] = {
+          Future
+            .successful {
+              if (failOnce.compareAndSet(true, false))
+                throw TestException(s"failed to process group of events'")
+              else
+                envelopes.foreach { envelope =>
+                  result.append(envelope.event).append("|")
+                }
+            }
+            .map(_ => Done)
+        }
+      }
+
+      val envelopes = createEnvelopes(pid1, 6)
+      val projectionFailing =
+        R2dbcProjection
+          .groupedWithinAsync(
+            projectionId,
+            Some(settings),
+            sourceProvider = sourceProvider(envelopes),
+            handler = () => handler())
+          .withGroup(5, 10.millis)
+          .withRecoveryStrategy(HandlerRecoveryStrategy.retryAndSkip(2, 10.millis))
+
+      offsetShouldBeEmpty()
+      projectionTestKit.run(projectionFailing) {
+        pending
+        // this is not yet working, e6 is not delivered
+        // there is a bug in the cleanup after recovering
+        result.toString shouldBe "e1|e2|e3|e4|e5|e6|"
+      }
+
+      offsetShouldBe(envelopes.last.offset)
     }
   }
 

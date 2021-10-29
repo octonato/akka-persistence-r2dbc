@@ -218,6 +218,7 @@ private[projection] object R2dbcProjectionImpl {
 
     new AdaptedHandler(handlerFactory()) {
       override def process(envelopes: immutable.Seq[Envelope]): Future[Done] = {
+
         val acceptedEnvelopes = envelopes.iterator.filterNot { env =>
           if (offsetStore.isEnvelopeDuplicate(env)) {
             // FIXME change to trace
@@ -234,7 +235,21 @@ private[projection] object R2dbcProjectionImpl {
         if (acceptedEnvelopes.isEmpty) {
           FutureDone
         } else {
-          delegate.process(acceptedEnvelopes)
+
+          val processFuture =
+            try {
+              delegate.process(acceptedEnvelopes)
+            } catch {
+              case NonFatal(e) => Future.failed(e)
+            }
+
+          processFuture.recoverWith { case ex =>
+            acceptedEnvelopes.foreach { env =>
+              log.debug("Handler failed to process {}. Removing from inflight map", envToString(env))
+              offsetStore.updateInflightOnError(env)
+            }
+            Future.failed(ex)
+          }
         }
       }
     }
